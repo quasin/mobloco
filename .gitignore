@@ -1,1 +1,8 @@
 !.gitignore
+
+# generated at runtime by feedcopy.py
+data/
+
+# python bytecode
+__pycache__/
+*.pyc
