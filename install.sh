@@ -16,9 +16,7 @@ python3 -m pip install --upgrade pip
 pip3 install -r requirements.txt
 
 mkdir data
-tee data/feeds.tsv <<EOF
-name	url	description
-EOF
+echo -e "name\turl\tdescription" > data/feeds.tsv
 
 # feed mirror: reads data/feeds.tsv on :00 and :30 UTC, writes data/ + data/logs.txt
 sudo tee /etc/systemd/system/mobloco-feeds.service >/dev/null <<EOF
