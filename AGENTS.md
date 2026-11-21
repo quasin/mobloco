@@ -13,8 +13,9 @@ mkdir -p data && printf 'name\turl\tdescription\n' > data/feeds.tsv
 ```
 
 Python 3.10+ (`sys`/`pathlib` style, `X | None` hints). Stdlib only in practice:
-`feedcopy.py` uses `urllib`, not `requests`/`feedparser`. Do not add a third-party
-dependency without a reason — feeds are copied as raw bytes, never parsed.
+`feedcopy.py` uses `urllib` and `xml.etree.ElementTree`, not `requests`/`feedparser`.
+Do not add a third-party dependency without a reason — feeds are mirrored as raw
+bytes; the only parsing is the stdlib extraction of entries for `data/feeds/`.
 
 ## Run & test
 
@@ -33,6 +34,14 @@ No linter/formatter/CI config exists in the repo; don't invent one.
 - `data/feeds.tsv` — `name<TAB>url<TAB>description`, optional header and `#` comments.
 - `data/<domain><ext>` — mirrored feed, filename derived from URL host (`www.`
   stripped, port dropped) and path suffix (`.atom/.xml/.rss/.rdf`, else `.xml`).
+- `data/feeds/<domain>.tsv` — entries extracted from each mirror after a
+  successful copy: `date`, `title`, `link`, `category`, `added`.
+  `date` = feed publication time, `added` = when the row was first written here
+  (both UTC ISO). New rows are prepended; a row is only added when its link (or
+  title, for link-less items) was not stored before, so files accumulate history
+  without duplicates. Tab/newline characters inside values are flattened.
+  The header changed from 3 to 5 columns; files with the old header are migrated
+  on the next cycle (`added` = file mtime, category backfilled from the mirror).
 - `data/logs.txt` — appended every run; also mirrored to stdout.
 
 `data/` is gitignored and generated at runtime. Never commit it.
@@ -40,8 +49,9 @@ No linter/formatter/CI config exists in the repo; don't invent one.
 ## Conventions
 
 - Functions return values that callers can assert on (`run_cycle` → failure count,
-  `main` → exit code), and logging goes through the module `log` logger with
-  `OK    `/`FAIL  ` prefixes — keep that shape so tests and `logs.txt` stay readable.
+  `update_entries` → (path, added), `main` → exit code), and logging goes through
+  the module `log` logger with `OK    `/`FAIL  `/`TSV   ` prefixes — keep that
+  shape so tests and `logs.txt` stay readable.
 - All timestamps are UTC (`UtcFormatter`, `utc_now`, `iso`); never use local time.
 - Writes go through `write_atomic` (tmp file + `os.replace`) so a failed download
   never truncates the previous copy. Route any new file write the same way.
@@ -59,6 +69,10 @@ No linter/formatter/CI config exists in the repo; don't invent one.
   without it.
 - Tests stub network access by assigning `feedcopy.fetch = lambda ...` and restore
   it in `tearDown`; do real HTTP only in manual `--once` runs.
+- A malformed mirror makes `update_entries` raise `ValueError`, so the feed counts
+  as `FAIL` even though the raw copy was written; the next successful cycle
+  rewrites the TSV. Deleted `data/feeds/<domain>.tsv` files are rebuilt from the
+  current mirror on the next cycle (older history is gone).
 - `install.sh` runs `sudo apt install`, writes the systemd unit, and ends with
   `sudo reboot` — never run it as part of a dev check.
 - `install.sh` truncates `data/feeds.tsv` when re-run; back up a populated feed

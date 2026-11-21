@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import csv
+import re
 import sys
 import tempfile
 import unittest
@@ -151,6 +153,190 @@ class CycleTests(unittest.TestCase):
         feedcopy.fetch = lambda url, timeout=0: b'{"blocked": true}'
         self.assertEqual(feedcopy.run_cycle(path, self.tmp), 1)
         self.assertFalse((self.tmp / "a.example.atom").exists())
+
+
+class EntriesTests(unittest.TestCase):
+    ATOM = (
+        "<feed xmlns='http://www.w3.org/2005/Atom'><title>t</title>"
+        "<entry><title>First</title><link href='https://a.example/1'/>"
+        "<updated>2026-11-21T01:18:42+00:00</updated>"
+        "<category term='f-1614' label='Англия'/></entry>"
+        "<entry><title>Second</title><link rel='enclosure' href='magnet:?xt=1'/>"
+        "<link href='https://a.example/2'/>"
+        "<updated>2026-11-20T10:00:00Z</updated></entry>"
+        "</feed>"
+    )
+    STAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        feedcopy.setup_logging(self.tmp / "logs.txt")
+        self.feed = feedcopy.Feed("A", "https://a.example/f.atom")
+        self.mirror = self.tmp / "a.example.atom"
+        self.tsv = self.tmp / "feeds" / "a.example.tsv"
+
+    def store(self, body: bytes) -> int:
+        self.mirror.write_bytes(body)
+        return feedcopy.update_entries(self.feed, self.tmp)[1]
+
+    def rows(self) -> list[list[str]]:
+        text = self.tsv.read_text(encoding="utf-8")
+        return list(csv.reader(text.splitlines(), delimiter="\t"))
+
+    def lines(self) -> list[str]:
+        return self.tsv.read_text(encoding="utf-8").splitlines()
+
+    def assert_stamp(self, value: str) -> None:
+        self.assertRegex(value, self.STAMP)
+
+    def test_header_has_category_and_added(self):
+        self.store(self.ATOM.encode())
+        self.assertEqual(self.rows()[0], ["date", "title", "link", "category", "added"])
+
+    def test_atom_entries_are_written_with_utc_dates_and_category(self):
+        self.assertEqual(self.store(self.ATOM.encode()), 2)
+        rows = self.rows()
+        self.assertEqual(
+            rows[1][:4], ["2026-11-21T01:18:42Z", "First", "https://a.example/1", "Англия"]
+        )
+        self.assertEqual(
+            rows[2][:4], ["2026-11-20T10:00:00Z", "Second", "https://a.example/2", ""]
+        )
+        self.assert_stamp(rows[1][4])
+        self.assert_stamp(rows[2][4])
+
+    def test_second_identical_run_adds_nothing_and_keeps_added(self):
+        self.store(self.ATOM.encode())
+        first_added = [row[4] for row in self.rows()[1:]]
+        self.assertEqual(self.store(self.ATOM.encode()), 0)
+        self.assertEqual(len(self.lines()), 3)
+        self.assertEqual([row[4] for row in self.rows()[1:]], first_added)
+
+    def test_new_entries_are_prepended(self):
+        self.store(self.ATOM.encode())
+        newer = (
+            "<feed xmlns='http://www.w3.org/2005/Atom'>"
+            "<entry><title>Third</title><link href='https://a.example/3'/>"
+            "<updated>2026-11-21T02:00:00Z</updated></entry>"
+            "</feed>"
+        )
+        self.assertEqual(self.store(newer.encode()), 1)
+        self.assertEqual(
+            self.rows()[1][:4],
+            ["2026-11-21T02:00:00Z", "Third", "https://a.example/3", ""],
+        )
+
+    def test_duplicate_links_inside_one_feed_are_collapsed(self):
+        doubled = self.ATOM.replace(
+            "</feed>",
+            "<entry><title>First again</title><link href='https://a.example/1'/>"
+            "</entry></feed>",
+        )
+        self.assertEqual(self.store(doubled.encode()), 2)
+
+    def test_rss_items_and_windows_1251_are_parsed(self):
+        rss = (
+            '<?xml version="1.0" encoding="windows-1251"?>'
+            "<rss><channel><title>t</title>"
+            "<item><title>Привет</title><pubDate>Sat, 21 Nov 2026 02:28:41 +0300</pubDate>"
+            "<link>https://b.example/1</link><category>Фильмы</category></item>"
+            "</channel></rss>"
+        )
+        feed = feedcopy.Feed("B", "https://b.example/rss.xml")
+        (self.tmp / "b.example.xml").write_bytes(rss.encode("windows-1251"))
+        feedcopy.update_entries(feed, self.tmp)
+        rows = list(
+            csv.reader(
+                (self.tmp / "feeds" / "b.example.tsv")
+                .read_text(encoding="utf-8")
+                .splitlines(),
+                delimiter="\t",
+            )
+        )
+        self.assertEqual(
+            rows[1][:4], ["2026-11-20T23:28:41Z", "Привет", "https://b.example/1", "Фильмы"]
+        )
+
+    def test_short_plain_description_is_used_as_category(self):
+        body = (
+            "<rss><channel><item><title>Game</title><link>https://r.example/1</link>"
+            "<description>Игры</description></item></channel></rss>"
+        ).encode()
+        self.store(body)
+        self.assertEqual(self.rows()[1][3], "Игры")
+
+    def test_html_description_is_not_used_as_category(self):
+        body = (
+            "<rss><channel><item><title>Game</title><link>https://r.example/2</link>"
+            "<description>&lt;a href='x'&gt;long html blurb&lt;/a&gt;</description>"
+            "</item></channel></rss>"
+        ).encode()
+        self.store(body)
+        self.assertEqual(self.rows()[1][3], "")
+
+    def test_tabs_and_newlines_inside_titles_are_flattened(self):
+        body = self.ATOM.replace("First", "Bad\ttitle\nhere").encode()
+        self.store(body)
+        self.assertEqual(len(self.rows()[1]), 5)
+        self.assertIn("Bad title here", self.rows()[1][1])
+
+    def test_titles_without_links_still_deduplicate(self):
+        body = (
+            "<feed xmlns='http://www.w3.org/2005/Atom'>"
+            "<entry><title>No link</title></entry></feed>"
+        ).encode()
+        self.assertEqual(self.store(body), 1)
+        self.assertEqual(self.store(body), 0)
+
+    def test_three_column_file_is_migrated(self):
+        self.tsv.parent.mkdir(parents=True, exist_ok=True)
+        self.tsv.write_text(
+            "date\ttitle\tlink\n"
+            "2026-11-21T01:18:42Z\tFirst\thttps://a.example/1\n",
+            encoding="utf-8",
+        )
+        only_first = (
+            "<feed xmlns='http://www.w3.org/2005/Atom'>"
+            "<entry><title>First</title><link href='https://a.example/1'/>"
+            "<category term='f-1614' label='Англия'/>"
+            "<updated>2026-11-21T01:18:42Z</updated></entry></feed>"
+        ).encode()
+        self.assertEqual(self.store(only_first), 0)
+        rows = self.rows()
+        self.assertEqual(rows[0], ["date", "title", "link", "category", "added"])
+        self.assertEqual(
+            rows[1][:4],
+            ["2026-11-21T01:18:42Z", "First", "https://a.example/1", "Англия"],
+        )
+        self.assert_stamp(rows[1][4])
+        self.assertEqual(len(rows), 2)
+
+    def test_run_cycle_populates_the_feeds_folder(self):
+        path = self.tmp / "feeds.tsv"
+        path.write_text(
+            "name\turl\tdescription\nA\thttps://a.example/f.atom\n", encoding="utf-8"
+        )
+        original = feedcopy.fetch
+        feedcopy.fetch = lambda url, timeout=0: self.ATOM.encode()
+        try:
+            self.assertEqual(feedcopy.run_cycle(path, self.tmp), 0)
+        finally:
+            feedcopy.fetch = original
+        self.assertTrue(self.tsv.exists())
+        self.assertIn("+2 new", (self.tmp / "logs.txt").read_text())
+        self.assertFalse(list((self.tmp / "feeds").glob("*.tmp")))
+
+    def test_unparseable_mirror_counts_as_failure(self):
+        path = self.tmp / "feeds.tsv"
+        path.write_text(
+            "name\turl\tdescription\nA\thttps://a.example/f.atom\n", encoding="utf-8"
+        )
+        original = feedcopy.fetch
+        feedcopy.fetch = lambda url, timeout=0: b"<feed><broken>"
+        try:
+            self.assertEqual(feedcopy.run_cycle(path, self.tmp), 1)
+        finally:
+            feedcopy.fetch = original
 
 
 if __name__ == "__main__":
